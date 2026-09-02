@@ -5320,6 +5320,52 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _spool_external_callback_if_configured(self, query: Any, data: str) -> bool:
+        extra = getattr(self.config, "extra", None) or {}
+        prefixes = extra.get("external_callback_prefixes") or []
+        if isinstance(prefixes, str):
+            prefixes = [prefixes]
+        prefixes = tuple(str(p) for p in prefixes if str(p).strip())
+        if not prefixes or not data.startswith(prefixes):
+            return False
+        spool = _Path(
+            os.path.expanduser(str(extra.get("external_callback_spool") or "~/.hermes/callback-spool"))
+        )
+        message = getattr(query, "message", None)
+        user = getattr(query, "from_user", None)
+        record = {
+            "callback_id": str(getattr(query, "id", "")),
+            "data": data,
+            "from": {
+                "id": getattr(user, "id", None),
+                "username": getattr(user, "username", None),
+                "first_name": getattr(user, "first_name", None),
+            },
+            "chat_id": getattr(message, "chat_id", None),
+            "message_id": getattr(message, "message_id", None),
+            "received_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        try:
+            spool.mkdir(parents=True, exist_ok=True)
+            os.chmod(spool, 0o700)
+            final = spool / f"{record['received_at'].replace(':', '')}-{record['callback_id']}.json"
+            temporary = final.with_suffix(".tmp")
+            temporary.write_text(json.dumps(record), encoding="utf-8")
+            os.chmod(temporary, 0o600)
+            temporary.replace(final)
+        except OSError as exc:
+            logger.error("[%s] external callback spool failed: %s", self.name, exc)
+            await self._answer_callback_quietly(query, "review bot unavailable")
+            return True
+        await self._answer_callback_quietly(query, "working…")
+        return True
+
+    async def _answer_callback_quietly(self, query: Any, text: str) -> None:
+        try:
+            await query.answer(text=text)
+        except Exception:
+            pass
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -5639,6 +5685,14 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
                         clarify_id,
                     )
+            return
+
+        # --- External callback spool ---
+        # Buttons rendered by trusted local tools (e.g. the Clipper review bot,
+        # prefix "cr:") are answered here and written to a spool directory the
+        # tool watches, so it never needs its own Telegram poller on this token.
+        # Opt in via platforms.telegram.extra.external_callback_prefixes.
+        if await self._spool_external_callback_if_configured(query, data):
             return
 
         # --- Update prompt callbacks ---
