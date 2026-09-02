@@ -5333,6 +5333,13 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         message = getattr(query, "message", None)
         user = getattr(query, "from_user", None)
+        allowed = extra.get("external_callback_allowed_user_ids") or []
+        if isinstance(allowed, (str, int)):
+            allowed = [allowed]
+        allowed = {str(a).strip() for a in allowed if str(a).strip()}
+        if allowed and str(getattr(user, "id", "")) not in allowed:
+            await self._answer_callback_quietly(query, "not authorized")
+            return True
         record = {
             "callback_id": str(getattr(query, "id", "")),
             "data": data,
@@ -5358,7 +5365,31 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._answer_callback_quietly(query, "review bot unavailable")
             return True
         await self._answer_callback_quietly(query, "working…")
+        # The consumer may be minutes away (it publishes synchronously), so take
+        # the buttons off right here and stamp the tap on the caption: a second
+        # tap on the same clip is what a lingering keyboard invites.
+        await self._acknowledge_external_callback(query, data, user)
         return True
+
+    async def _acknowledge_external_callback(self, query: Any, data: str, user: Any) -> None:
+        message = getattr(query, "message", None)
+        if message is None:
+            return
+        action = "Approve" if data.split(":")[1:2] == ["a"] else ("Deny" if data.split(":")[1:2] == ["d"] else "Tap")
+        who = getattr(user, "first_name", None) or getattr(user, "username", None) or "someone"
+        stamp = datetime.now(timezone.utc).astimezone().strftime("%-I:%M %p")
+        line = f"⏳ {action} tapped by {who} at {stamp} — working…"
+        caption = getattr(message, "caption", None)
+        try:
+            if caption is not None:
+                new_caption = f"{caption}\n{line}"
+                if len(new_caption) > 1024:
+                    new_caption = caption[: 1024 - len(line) - 1] + "\n" + line
+                await query.edit_message_caption(caption=new_caption, reply_markup=None)
+            else:
+                await query.edit_message_reply_markup(reply_markup=None)
+        except Exception as exc:  # "message is not modified", deleted message, etc.
+            logger.info("[%s] external callback acknowledge skipped: %s", self.name, exc)
 
     async def _answer_callback_quietly(self, query: Any, text: str) -> None:
         try:
