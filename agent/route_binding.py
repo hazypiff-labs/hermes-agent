@@ -67,6 +67,13 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     agent.base_url, agent.api_mode = base_url, api_mode
     # reasoning_content echo opt-in travels with the active provider; restore_primary_runtime reverts it.
     agent._reasoning_echo_flag = bool(entry.get("reasoning_echo", False))
+    # Local patch (2026-10-04): a fallback_providers entry may pin its own output cap via
+    # max_output_tokens (vLLM rejects max_tokens above max_model_len). The primary value is
+    # restored in _apply_primary_runtime_fields.
+    if not hasattr(agent, "_primary_max_tokens_saved"):
+        agent._primary_max_tokens_saved = agent.max_tokens
+    _fb_mot = entry.get("max_output_tokens")
+    agent.max_tokens = _fb_mot if isinstance(_fb_mot, int) and _fb_mot > 0 else agent._primary_max_tokens_saved
     if hasattr(agent, "_transport_cache"):
         agent._transport_cache.clear()
     from agent.turn_recovery_codex import reset_codex_reasoning_replay

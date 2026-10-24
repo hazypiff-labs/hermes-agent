@@ -1139,6 +1139,9 @@ def _apply_primary_runtime_fields(agent, rt: dict[str, Any]) -> None:
     agent.base_url = rt["base_url"]           # setter updates _base_url_lower
     from hermes_cli.providers import is_actual_route
     agent.api_mode = "chat_completions" if is_actual_route(agent.provider, agent.base_url) else rt["api_mode"]
+    if hasattr(agent, "_primary_max_tokens_saved"):  # local patch 2026-10-04, see route_binding
+        agent.max_tokens = agent._primary_max_tokens_saved
+        del agent._primary_max_tokens_saved
     if hasattr(agent, "_transport_cache"):
         agent._transport_cache.clear()
     agent.api_key = rt["api_key"]

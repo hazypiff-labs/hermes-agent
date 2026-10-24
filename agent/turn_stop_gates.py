@@ -50,10 +50,71 @@ def _verify_on_stop_nudge(agent) -> Optional[str]:
     return None
 
 
+_PRE_VERIFY_FS_FALLBACK_MAX_PATHS = 200
+
+
+def _pre_verify_fs_fallback_paths() -> List[str]:
+    """Filesystem truth for the ``pre_verify`` firing condition (opt-in).
+
+    ``agent._turn_file_mutation_paths`` only registers write_file/patch
+    results classified as landed, so a turn that edited files through
+    ``execute_code`` (or any other path) never reaches the hook. When
+    ``HERMES_PRE_VERIFY_FS_FALLBACK`` is truthy we ask git for the dirty
+    worktree instead of the tracker. Anything unexpected — no git, not a
+    work tree, timeout — yields no paths, so the hook simply does not fire
+    (agent-harness full-3b). Off by default: unset, the firing condition is
+    byte-identical to before.
+    """
+    if (os.environ.get("HERMES_PRE_VERIFY_FS_FALLBACK") or "").strip().lower() \
+            not in ("1", "true", "yes"):
+        return []
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=os.getcwd(), timeout=5,
+        )
+        if proc.returncode != 0:  # not a git work tree (or git failed)
+            return []
+        lines = proc.stdout.splitlines()
+    except Exception:
+        return []
+    paths = set()
+    for line in lines:
+        if len(line) < 4:
+            continue
+        entry, status = line[3:], line[:2]
+        # Rename/copy entries read "old -> new"; the destination is the path
+        # that exists on disk now.
+        if ("R" in status or "C" in status) and " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        entry = entry.strip()
+        if entry.startswith('"') and entry.endswith('"') and len(entry) > 1:
+            entry = _unquote_porcelain_path(entry)
+        if entry:
+            paths.add(entry)
+    return sorted(paths)[:_PRE_VERIFY_FS_FALLBACK_MAX_PATHS]
+
+
+def _unquote_porcelain_path(entry: str) -> str:
+    """Decode git's C-style quoting (``"caf\\303\\251.py"``)."""
+    try:
+        return (entry[1:-1].encode("utf-8", "surrogateescape")
+                .decode("unicode_escape").encode("latin-1")
+                .decode("utf-8", "replace"))
+    except Exception:
+        return entry[1:-1]
+
+
 def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
     """After code edits a registered ``pre_verify`` hook may keep the agent going one
     more turn; no default continuation cost."""
     _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
+    if not _edited:
+        # Opt-in coverage for edits the mutation tracker misses (execute_code and friends);
+        # no-op unless the harness sets HERMES_PRE_VERIFY_FS_FALLBACK (agent-harness full-3b).
+        _edited = _pre_verify_fs_fallback_paths()
     try:
         from agent.verify_hooks import max_verify_nudges
         from hermes_cli.lifecycle import has_hook

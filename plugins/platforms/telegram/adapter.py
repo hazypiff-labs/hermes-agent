@@ -515,6 +515,21 @@ class _PollingStallError(RuntimeError):
     """
 
 
+def external_callback_spool_dir(extra: Dict[str, Any], data: str) -> _Path:
+    """Spool directory for an external callback.
+
+    ``external_callback_spools`` maps a prefix to its own directory so two local
+    tools sharing one bot never consume each other's taps; everything else
+    lands in ``external_callback_spool`` as before.
+    """
+    per_prefix = extra.get("external_callback_spools") or {}
+    if isinstance(per_prefix, dict):
+        for prefix, directory in per_prefix.items():
+            if str(prefix).strip() and data.startswith(str(prefix)) and str(directory or "").strip():
+                return _Path(os.path.expanduser(str(directory)))
+    return _Path(os.path.expanduser(str(extra.get("external_callback_spool") or "~/.hermes/callback-spool")))
+
+
 class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
@@ -4707,6 +4722,85 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         await query.answer(text=denial_text)
         return False
 
+    async def _spool_external_callback_if_configured(self, query: Any, data: str) -> bool:
+        extra = getattr(self.config, "extra", None) or {}
+        prefixes = extra.get("external_callback_prefixes") or []
+        if isinstance(prefixes, str):
+            prefixes = [prefixes]
+        prefixes = tuple(str(p) for p in prefixes if str(p).strip())
+        if not prefixes or not data.startswith(prefixes):
+            return False
+        spool = external_callback_spool_dir(extra, data)
+        message = getattr(query, "message", None)
+        user = getattr(query, "from_user", None)
+        allowed = extra.get("external_callback_allowed_user_ids") or []
+        if isinstance(allowed, (str, int)):
+            allowed = [allowed]
+        allowed = {str(a).strip() for a in allowed if str(a).strip()}
+        if allowed and str(getattr(user, "id", "")) not in allowed:
+            await self._answer_callback_quietly(query, "not authorized")
+            return True
+        record = {
+            "callback_id": str(getattr(query, "id", "")),
+            "data": data,
+            "from": {
+                "id": getattr(user, "id", None),
+                "username": getattr(user, "username", None),
+                "first_name": getattr(user, "first_name", None),
+            },
+            "chat_id": getattr(message, "chat_id", None),
+            "message_id": getattr(message, "message_id", None),
+            "received_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        try:
+            spool.mkdir(parents=True, exist_ok=True)
+            os.chmod(spool, 0o700)
+            final = spool / f"{record['received_at'].replace(':', '')}-{record['callback_id']}.json"
+            temporary = final.with_suffix(".tmp")
+            temporary.write_text(json.dumps(record), encoding="utf-8")
+            os.chmod(temporary, 0o600)
+            temporary.replace(final)
+        except OSError as exc:
+            logger.error("[%s] external callback spool failed: %s", self.name, exc)
+            await self._answer_callback_quietly(query, "review bot unavailable")
+            return True
+        await self._answer_callback_quietly(query, "working…")
+        # The consumer may be minutes away (it publishes synchronously), so take
+        # the buttons off right here and stamp the tap on the caption: a second
+        # tap on the same clip is what a lingering keyboard invites.
+        if data.split(":")[1:2] != ["t"]:
+            await self._acknowledge_external_callback(query, data, user)
+        return True
+
+    async def _acknowledge_external_callback(self, query: Any, data: str, user: Any) -> None:
+        message = getattr(query, "message", None)
+        if message is None:
+            return
+        if data.startswith("ca:"):
+            action = "Ack"
+        else:
+            action = "Approve" if data.split(":")[1:2] == ["a"] else ("Deny" if data.split(":")[1:2] == ["d"] else "Tap")
+        who = getattr(user, "first_name", None) or getattr(user, "username", None) or "someone"
+        stamp = datetime.now(timezone.utc).astimezone().strftime("%-I:%M %p")
+        line = f"⏳ {action} tapped by {who} at {stamp} — working…"
+        caption = getattr(message, "caption", None)
+        try:
+            if caption is not None:
+                new_caption = f"{caption}\n{line}"
+                if len(new_caption) > 1024:
+                    new_caption = caption[: 1024 - len(line) - 1] + "\n" + line
+                await query.edit_message_caption(caption=new_caption, reply_markup=None)
+            else:
+                await query.edit_message_reply_markup(reply_markup=None)
+        except Exception as exc:  # "message is not modified", deleted message, etc.
+            logger.info("[%s] external callback acknowledge skipped: %s", self.name, exc)
+
+    async def _answer_callback_quietly(self, query: Any, text: str) -> None:
+        try:
+            await query.answer(text=text)
+        except Exception:
+            pass
+
     async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Dispatch inline keyboard button clicks on the callback_data prefix."""
         query = update.callback_query
@@ -4715,6 +4809,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._accept_update()
         data = query.data
         cb = self._callback_ctx(query)
+        # --- External callback spool (local patch) ---
+        # Buttons rendered by trusted local tools (the Clipper review bot "cr:", the alert Ack "ca:")
+        # are answered here and written to a spool directory the tool watches, so it never needs its
+        # own Telegram poller on this token. Opt in via platforms.telegram.extra.external_callback_prefixes.
+        if await self._spool_external_callback_if_configured(query, data):
+            return
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
             (("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:"), self._handle_model_picker_callback),
@@ -6498,6 +6598,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
+            return
+        from .external_replies import spool_reply  # local patch: replies bound to external prompts
+        if await spool_reply(self, msg):
             return
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return

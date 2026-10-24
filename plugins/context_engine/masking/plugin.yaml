@@ -1,0 +1,7 @@
+name: masking
+description: >-
+  Observation masking (JetBrains LastNObservations). Masks old tool observations
+  with mechanical placeholders while preserving all actions and reasoning; falls
+  back to the built-in compressor when masking alone cannot fit the budget.
+  HERMES_CONTEXT_MODE=current disables masking at runtime for A/B control.
+version: 0.1.0
