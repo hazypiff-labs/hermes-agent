@@ -1167,6 +1167,9 @@ def restore_primary_runtime(agent) -> bool:
         agent.provider = rt["provider"]
         agent.base_url = rt["base_url"]           # setter updates _base_url_lower
         agent.api_mode = rt["api_mode"]
+        if hasattr(agent, "_primary_max_tokens_saved"):  # local patch 2026-10-04
+            agent.max_tokens = agent._primary_max_tokens_saved
+            del agent._primary_max_tokens_saved
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]

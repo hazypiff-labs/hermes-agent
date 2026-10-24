@@ -424,6 +424,21 @@ _UPDATER_STOP_TIMEOUT = 15.0
 _UPDATER_START_TIMEOUT = 30.0
 
 
+def external_callback_spool_dir(extra: Dict[str, Any], data: str) -> _Path:
+    """Spool directory for an external callback.
+
+    ``external_callback_spools`` maps a prefix to its own directory so two local
+    tools sharing one bot never consume each other's taps; everything else
+    lands in ``external_callback_spool`` as before.
+    """
+    per_prefix = extra.get("external_callback_spools") or {}
+    if isinstance(per_prefix, dict):
+        for prefix, directory in per_prefix.items():
+            if str(prefix).strip() and data.startswith(str(prefix)) and str(directory or "").strip():
+                return _Path(os.path.expanduser(str(directory)))
+    return _Path(os.path.expanduser(str(extra.get("external_callback_spool") or "~/.hermes/callback-spool")))
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -5328,9 +5343,7 @@ class TelegramAdapter(BasePlatformAdapter):
         prefixes = tuple(str(p) for p in prefixes if str(p).strip())
         if not prefixes or not data.startswith(prefixes):
             return False
-        spool = _Path(
-            os.path.expanduser(str(extra.get("external_callback_spool") or "~/.hermes/callback-spool"))
-        )
+        spool = external_callback_spool_dir(extra, data)
         message = getattr(query, "message", None)
         user = getattr(query, "from_user", None)
         allowed = extra.get("external_callback_allowed_user_ids") or []
@@ -5368,14 +5381,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # The consumer may be minutes away (it publishes synchronously), so take
         # the buttons off right here and stamp the tap on the caption: a second
         # tap on the same clip is what a lingering keyboard invites.
-        await self._acknowledge_external_callback(query, data, user)
+        if data.split(":")[1:2] != ["t"]:
+            await self._acknowledge_external_callback(query, data, user)
         return True
 
     async def _acknowledge_external_callback(self, query: Any, data: str, user: Any) -> None:
         message = getattr(query, "message", None)
         if message is None:
             return
-        action = "Approve" if data.split(":")[1:2] == ["a"] else ("Deny" if data.split(":")[1:2] == ["d"] else "Tap")
+        if data.startswith("ca:"):
+            action = "Ack"
+        else:
+            action = "Approve" if data.split(":")[1:2] == ["a"] else ("Deny" if data.split(":")[1:2] == ["d"] else "Tap")
         who = getattr(user, "first_name", None) or getattr(user, "username", None) or "someone"
         stamp = datetime.now(timezone.utc).astimezone().strftime("%-I:%M %p")
         line = f"⏳ {action} tapped by {who} at {stamp} — working…"
@@ -7612,6 +7629,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "from_user", None), "id", None),
                 getattr(getattr(msg, "chat", None), "id", None),
             )
+            return
+        from .external_replies import spool_reply
+        if await spool_reply(self, msg):
             return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):

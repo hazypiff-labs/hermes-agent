@@ -1507,6 +1507,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        # Local patch (2026-10-04): a fallback_providers entry may pin its own
+        # output cap via max_output_tokens (vLLM rejects max_tokens above
+        # max_model_len). The primary value is restored in restore_primary_runtime.
+        if not hasattr(agent, "_primary_max_tokens_saved"):
+            agent._primary_max_tokens_saved = agent.max_tokens
+        _fb_mot = fb.get("max_output_tokens")
+        agent.max_tokens = (_fb_mot if isinstance(_fb_mot, int) and _fb_mot > 0
+                            else agent._primary_max_tokens_saved)
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
