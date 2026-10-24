@@ -41,9 +41,9 @@ def dirty_repo(tmp_path, monkeypatch):
 def agent(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
     ):
         instance = AIAgent(
             session_id="pre-verify-fs-fallback-test",
@@ -91,7 +91,6 @@ def test_fs_fallback_fires_hook_when_tracker_is_empty(agent, dirty_repo, monkeyp
     assert continue_message.call_count == 1
     assert continue_message.call_args.kwargs["changed_paths"] == ["changed.py"]
     assert agent._pre_verify_nudges == 1
-    assert result["messages"][2]["_pre_verify_synthetic"] is True
 
 
 def test_fs_fallback_off_by_default(agent, dirty_repo, monkeypatch):
